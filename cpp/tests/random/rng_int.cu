@@ -387,6 +387,44 @@ TEST(RngNormalIntUnsigned, U32)
   }
 }
 
+/**
+ * A positive deviate above INT32_MAX still fits a uint32_t output, so it must not pass through
+ * int32_t on the way: the device would saturate it to INT32_MAX (or INT32_MIN for negatives).
+ * sigma is kept below 2^32 / 6 so every deviate fits uint32_t, since beyond that is out of range.
+ */
+TEST(RngNormalIntUnsigned, U32DeviateAboveInt32Max)
+{
+  for (auto gtype : {GenPhilox, GenPC}) {
+    raft::resources handle;
+    auto stream       = resource::get_cuda_stream(handle);
+    constexpr int len = 32 * 1024;
+
+    rmm::device_uvector<uint32_t> out(len, stream);
+    RngState r(1234ULL, gtype);
+    normalInt(handle, r, out.data(), len, uint32_t(0), uint32_t(700000000));
+
+    std::vector<uint32_t> h_out(len);
+    update_host(h_out.data(), out.data(), len, stream);
+    resource::sync_stream(handle, stream);
+
+    int saturated = 0;
+    for (int i = 0; i < len; ++i) {
+      saturated += h_out[i] == 2147483647U || h_out[i] == 2147483648U;
+    }
+    ASSERT_LT(saturated, 3) << "deviates beyond INT32_MAX were clamped";
+  }
+}
+
+TEST(RngNormalIntBool, Compiles)
+{
+  raft::resources handle;
+  auto stream = resource::get_cuda_stream(handle);
+  rmm::device_uvector<bool> out(1024, stream);
+  RngState r(1234ULL, GenPC);
+  normalInt(handle, r, out.data(), 1024, true, true);
+  resource::sync_stream(handle, stream);
+}
+
 TEST(RngNormalIntUnsigned, U64)
 {
   for (auto gtype : {GenPhilox, GenPC}) {
