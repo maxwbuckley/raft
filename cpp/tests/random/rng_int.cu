@@ -349,5 +349,50 @@ TEST(RngNormalIntLargeMu, S64)
   }
 }
 
+/**
+ * With an unsigned output, a negative deviate converted straight to the output type saturates to
+ * 0 on the device, collapsing every sample below mu onto mu. The shifted/centered comparison above
+ * cannot see that, since both draws collapse identically, so check both sides of mu directly.
+ */
+template <typename T>
+void testNormalIntUnsignedBothSides(T mu, T sigma, GeneratorType gtype)
+{
+  raft::resources handle;
+  auto stream       = resource::get_cuda_stream(handle);
+  constexpr int len = 32 * 1024;
+
+  rmm::device_uvector<T> out(len, stream);
+  RngState r(1234ULL, gtype);
+  normalInt(handle, r, out.data(), len, mu, sigma);
+
+  std::vector<T> h_out(len);
+  update_host(h_out.data(), out.data(), len, stream);
+  resource::sync_stream(handle, stream);
+
+  int below = 0;
+  int above = 0;
+  for (int i = 0; i < len; ++i) {
+    below += h_out[i] < mu;
+    above += h_out[i] > mu;
+  }
+  ASSERT_GT(below, len / 3) << "mu=" << mu << " sigma=" << sigma;
+  ASSERT_GT(above, len / 3) << "mu=" << mu << " sigma=" << sigma;
+}
+
+TEST(RngNormalIntUnsigned, U32)
+{
+  for (auto gtype : {GenPhilox, GenPC}) {
+    testNormalIntUnsignedBothSides<uint32_t>(10000000, 10000, gtype);
+    testNormalIntUnsignedBothSides<uint32_t>(4000000000U, 10, gtype);  // above INT32_MAX
+  }
+}
+
+TEST(RngNormalIntUnsigned, U64)
+{
+  for (auto gtype : {GenPhilox, GenPC}) {
+    testNormalIntUnsignedBothSides<uint64_t>(10000000, 10000, gtype);
+  }
+}
+
 }  // namespace random
 }  // namespace raft

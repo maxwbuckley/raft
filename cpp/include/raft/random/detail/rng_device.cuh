@@ -17,6 +17,7 @@
 #include <curand_kernel.h>
 
 #include <random>
+#include <type_traits>
 
 namespace raft {
 namespace random {
@@ -259,8 +260,11 @@ HDI void custom_next(GenType& gen,
   gen.next(res2);
   compute_t sigma = static_cast<compute_t>(params.sigma);
   box_muller_transform<compute_t>(res1, res2, sigma, compute_t(0));
-  *val       = static_cast<IntType>(res1) + params.mu;
-  *(val + 1) = static_cast<IntType>(res2) + params.mu;
+  // A negative deviate must not be converted straight to an unsigned IntType: that is undefined,
+  // and the device saturates it to 0. Going through the signed type wraps it modulo 2^n instead.
+  using signed_t = std::make_signed_t<IntType>;
+  *val       = static_cast<IntType>(params.mu + static_cast<IntType>(static_cast<signed_t>(res1)));
+  *(val + 1) = static_cast<IntType>(params.mu + static_cast<IntType>(static_cast<signed_t>(res2)));
 }
 
 template <typename GenType, typename OutType, typename LenType>
