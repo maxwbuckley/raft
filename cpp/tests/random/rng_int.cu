@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <vector>
 
 namespace raft {
@@ -387,32 +388,94 @@ TEST(RngNormalIntUnsigned, U32)
   }
 }
 
+template <typename T>
+std::vector<T> drawNormalInt(T mu, T sigma, GeneratorType gtype, int len)
+{
+  raft::resources handle;
+  auto stream = resource::get_cuda_stream(handle);
+  rmm::device_uvector<T> out(len, stream);
+  RngState r(1234ULL, gtype);
+  normalInt(handle, r, out.data(), len, mu, sigma);
+  std::vector<T> h_out(len);
+  update_host(h_out.data(), out.data(), len, stream);
+  resource::sync_stream(handle, stream);
+  return h_out;
+}
+
 /**
- * A positive deviate above INT32_MAX still fits a uint32_t output, so it must not pass through
- * int32_t on the way: the device would saturate it to INT32_MAX (or INT32_MIN for negatives).
- * sigma is kept below 2^32 / 6 so every deviate fits uint32_t, since beyond that is out of range.
+ * A positive deviate above INT32_MAX still fits a uint32_t output, so it must come through intact
+ * rather than being clamped at INT32_MAX or INT32_MIN on the way. With mu = 0, every negative
+ * deviate is out of range and must saturate to 0; wrapping would put it near UINT32_MAX instead.
  */
 TEST(RngNormalIntUnsigned, U32DeviateAboveInt32Max)
 {
+  constexpr int len = 32 * 1024;
   for (auto gtype : {GenPhilox, GenPC}) {
-    raft::resources handle;
-    auto stream       = resource::get_cuda_stream(handle);
-    constexpr int len = 32 * 1024;
+    auto h_out = drawNormalInt<uint32_t>(0, 700000000, gtype, len);
 
-    rmm::device_uvector<uint32_t> out(len, stream);
-    RngState r(1234ULL, gtype);
-    normalInt(handle, r, out.data(), len, uint32_t(0), uint32_t(700000000));
-
-    std::vector<uint32_t> h_out(len);
-    update_host(h_out.data(), out.data(), len, stream);
-    resource::sync_stream(handle, stream);
-
-    int saturated = 0;
-    for (int i = 0; i < len; ++i) {
-      saturated += h_out[i] == 2147483647U || h_out[i] == 2147483648U;
+    int zero = 0, above_int32 = 0, at_int32_edge = 0;
+    for (auto v : h_out) {
+      zero += v == 0;
+      above_int32 += v > 2147483648U;
+      at_int32_edge += v == 2147483647U || v == 2147483648U;
     }
-    ASSERT_LT(saturated, 3) << "deviates beyond INT32_MAX were clamped";
+    ASSERT_GT(zero, len * 45 / 100) << "negative deviates must saturate to 0";
+    ASSERT_LT(zero, len * 55 / 100);
+    ASSERT_GT(above_int32, 0) << "deviates above INT32_MAX were lost";
+    ASSERT_LT(at_int32_edge, 3) << "deviates beyond INT32_MAX were clamped";
   }
+}
+
+/**
+ * Samples that fall outside the output type saturate to its bounds, as converting the exact sum
+ * mu + deviate would on the device. With mu a few units from a bound, about half the samples
+ * saturate there and none may wrap around to the far end of the range.
+ */
+template <typename T>
+void testNormalIntSaturates(T mu, T sigma, bool at_low_end)
+{
+  constexpr int len = 32 * 1024;
+  const T bound     = at_low_end ? std::numeric_limits<T>::lowest() : std::numeric_limits<T>::max();
+  for (auto gtype : {GenPhilox, GenPC}) {
+    auto h_out = drawNormalInt<T>(mu, sigma, gtype, len);
+
+    int saturated = 0, wrapped = 0;
+    for (auto v : h_out) {
+      saturated += v == bound;
+      // Every in-range sample is within 6 sigma of mu, since the deviate is at most ~5.8 sigma.
+      // Measure the distance in the unsigned type so a wrapped value cannot overflow it.
+      using U      = std::make_unsigned_t<T>;
+      const U dist = v < mu ? U(U(mu) - U(v)) : U(U(v) - U(mu));
+      wrapped += dist > U(6) * U(sigma) && v != bound;
+    }
+    ASSERT_GT(saturated, len * 45 / 100) << "mu=" << mu << " sigma=" << sigma;
+    ASSERT_LT(saturated, len * 55 / 100) << "mu=" << mu << " sigma=" << sigma;
+    ASSERT_EQ(wrapped, 0) << "mu=" << mu << " sigma=" << sigma;
+  }
+}
+
+TEST(RngNormalIntSaturates, U32)
+{
+  testNormalIntSaturates<uint32_t>(5, 1000, true);
+  testNormalIntSaturates<uint32_t>(std::numeric_limits<uint32_t>::max() - 5, 1000, false);
+}
+
+TEST(RngNormalIntSaturates, S32)
+{
+  testNormalIntSaturates<int32_t>(std::numeric_limits<int32_t>::lowest() + 5, 1000, true);
+  testNormalIntSaturates<int32_t>(std::numeric_limits<int32_t>::max() - 5, 1000, false);
+}
+
+TEST(RngNormalIntSaturates, U64)
+{
+  testNormalIntSaturates<uint64_t>(5, 1000, true);
+  testNormalIntSaturates<uint64_t>(std::numeric_limits<uint64_t>::max() - 5, 1000, false);
+}
+
+TEST(RngNormalIntSaturates, S64)
+{
+  testNormalIntSaturates<int64_t>(std::numeric_limits<int64_t>::lowest() + 5, 1000, true);
+  testNormalIntSaturates<int64_t>(std::numeric_limits<int64_t>::max() - 5, 1000, false);
 }
 
 TEST(RngNormalIntBool, Compiles)

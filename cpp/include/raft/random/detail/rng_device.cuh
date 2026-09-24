@@ -16,6 +16,7 @@
 
 #include <curand_kernel.h>
 
+#include <limits>
 #include <random>
 #include <type_traits>
 
@@ -237,6 +238,37 @@ HDI void custom_next(
   *(val + 1) = res2;
 }
 
+template <typename IntType>
+struct shift_unsigned {
+  using type = std::make_unsigned_t<IntType>;
+};
+template <>
+struct shift_unsigned<bool> {
+  using type = unsigned char;
+};
+
+/**
+ * mu + trunc(dev), saturated to the range of IntType, which is what converting the exact sum
+ * would give on the device. The bounds are checked in the unsigned type of the same width, so
+ * nothing overflows and a negative deviate is never converted to an unsigned type.
+ */
+template <typename IntType, typename T>
+HDI IntType shift_by_deviate(IntType mu, T dev)
+{
+  using U           = typename shift_unsigned<IntType>::type;
+  constexpr auto lo = std::numeric_limits<IntType>::lowest();
+  constexpr auto hi = std::numeric_limits<IntType>::max();
+
+  const bool neg = dev < T(0);
+  const T mag    = neg ? -dev : dev;
+  const U room   = neg ? U(U(mu) - U(lo)) : U(U(hi) - U(mu));
+  // T(max) + 1 rounds to exactly 2^digits, so below it the conversion to U is in range.
+  if (mag >= T(std::numeric_limits<U>::max()) + T(1)) { return neg ? lo : hi; }
+  const U m = static_cast<U>(mag);
+  if (m > room) { return neg ? lo : hi; }
+  return static_cast<IntType>(neg ? U(U(mu) - m) : U(U(mu) + m));
+}
+
 template <typename GenType, typename IntType, typename LenType>
 HDI void custom_next(GenType& gen,
                      IntType* val,
@@ -260,12 +292,8 @@ HDI void custom_next(GenType& gen,
   gen.next(res2);
   compute_t sigma = static_cast<compute_t>(params.sigma);
   box_muller_transform<compute_t>(res1, res2, sigma, compute_t(0));
-  // Only convert the deviate's magnitude to IntType: a negative value converted to an unsigned
-  // IntType is undefined, and the device saturates it to 0.
-  *val       = res1 < 0 ? static_cast<IntType>(params.mu - static_cast<IntType>(-res1))
-                        : static_cast<IntType>(params.mu + static_cast<IntType>(res1));
-  *(val + 1) = res2 < 0 ? static_cast<IntType>(params.mu - static_cast<IntType>(-res2))
-                        : static_cast<IntType>(params.mu + static_cast<IntType>(res2));
+  *val       = shift_by_deviate(params.mu, res1);
+  *(val + 1) = shift_by_deviate(params.mu, res2);
 }
 
 template <typename GenType, typename OutType, typename LenType>
